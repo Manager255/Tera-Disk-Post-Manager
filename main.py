@@ -115,24 +115,35 @@ _SB_HEADERS = {
 
 
 async def _sb_get(key: str) -> Optional[str]:
-    async with httpx.AsyncClient() as c:
-        r = await c.get(
-            _SB_TABLE,
-            headers=_SB_HEADERS,
-            params={"key_name": f"eq.{key}", "select": "key_value"},
-        )
-    if r.status_code == 200:
-        rows = r.json()
-        if rows:
-            return rows[0]["key_value"]
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.get(
+                _SB_TABLE,
+                headers=_SB_HEADERS,
+                params={"key_name": f"eq.{key}", "select": "key_value"},
+            )
+        if r.status_code == 200:
+            rows = r.json()
+            if rows:
+                return rows[0]["key_value"]
+        else:
+            log.warning("Supabase GET %s → HTTP %s", key, r.status_code)
+    except Exception as exc:
+        log.warning("Supabase GET failed for '%s': %s", key, exc)
     return None
 
 
 async def _sb_upsert(key: str, value: str) -> bool:
-    headers = {**_SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"}
-    async with httpx.AsyncClient() as c:
-        r = await c.post(_SB_TABLE, headers=headers, json={"key_name": key, "key_value": value})
-    return r.status_code in (200, 201, 204)
+    try:
+        headers = {**_SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"}
+        async with httpx.AsyncClient(timeout=10) as c:
+            r = await c.post(_SB_TABLE, headers=headers, json={"key_name": key, "key_value": value})
+        if r.status_code in (200, 201, 204):
+            return True
+        log.warning("Supabase UPSERT %s → HTTP %s", key, r.status_code)
+    except Exception as exc:
+        log.warning("Supabase UPSERT failed for '%s': %s", key, exc)
+    return False
 
 
 async def sb_load_channels() -> None:

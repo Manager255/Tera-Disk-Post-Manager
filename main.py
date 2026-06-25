@@ -2,28 +2,36 @@
 XVIP Hybrid Telegram Bot + Userbot
 ====================================
 Architecture:
-  - Bot Client  : python-telegram-bot style Admin UI (via Telethon bot-mode)
-  - Userbot Client : Telethon StringSession — handles source monitoring & bot-to-bot delivery
-  - DB          : Supabase REST API (httpx) — stores ONLY the string session
-  - Deploy      : Railway (all secrets via env vars)
+  - Bot Client   : Telethon bot-mode  — Admin commands
+  - Userbot      : Telethon StringSession — source monitoring & pipeline delivery
+  - DB           : Supabase REST — stores dynamic channel lists
+  - Session      : STRING_SESSION env var (mandatory) — set manually before deploy
 
 Required env vars:
   API_ID, API_HASH, BOT_TOKEN, ADMIN_IDS,
   SUPABASE_URL, SUPABASE_KEY,
-  TERA_SOURCE_CHANNELS, DISK_SOURCE_CHANNELS,
+  STRING_SESSION,
   TERA_CONVERTER_BOT, DISK_CONVERTER_BOT,
   TERA_DESTINATION, DISK_DESTINATION
+
+Optional env vars (one-time seed — DB takes over after first save):
+  TERA_SOURCE_CHANNELS, DISK_SOURCE_CHANNELS
 """
 
 import asyncio
+import functools
+import json
 import logging
 import os
+import re
 import sys
 from typing import Optional
 
 import httpx
 from telethon import TelegramClient, events, errors
 from telethon.sessions import StringSession
+from telethon.tl.functions.bots import SetBotCommandsRequest
+from telethon.tl.types import BotCommand, BotCommandScopeDefault
 
 # ─────────────────────────────────────────────
 # LOGGING
@@ -47,7 +55,6 @@ def _require(key: str) -> str:
 
 
 def _parse_ids(raw: str) -> list[int]:
-    """Parse comma-separated numeric IDs, silently skip blanks."""
     result = []
     for part in raw.split(","):
         part = part.strip()
@@ -56,58 +63,63 @@ def _parse_ids(raw: str) -> list[int]:
     return result
 
 
-def _clean_username(username: str) -> str:
-    """Strip '@' and lowercase — safe for send_message() calls."""
-    return username.strip().lstrip("@").lower()
+def _clean_username(u: str) -> str:
+    return u.strip().lstrip("@").lower()
 
 
-API_ID              = int(_require("API_ID"))
-API_HASH            = _require("API_HASH")
-BOT_TOKEN           = _require("BOT_TOKEN")
-ADMIN_IDS           = set(_parse_ids(_require("ADMIN_IDS")))
-SUPABASE_URL        = _require("SUPABASE_URL").rstrip("/")
-SUPABASE_KEY        = _require("SUPABASE_KEY")
+API_ID             = int(_require("API_ID"))
+API_HASH           = _require("API_HASH")
+BOT_TOKEN          = _require("BOT_TOKEN")
+ADMIN_IDS          = set(_parse_ids(_require("ADMIN_IDS")))
+SUPABASE_URL       = _require("SUPABASE_URL").rstrip("/")
+SUPABASE_KEY       = _require("SUPABASE_KEY")
+STRING_SESSION     = _require("STRING_SESSION")
 
-TERA_SOURCE_IDS     = _parse_ids(_require("TERA_SOURCE_CHANNELS"))
-DISK_SOURCE_IDS     = _parse_ids(_require("DISK_SOURCE_CHANNELS"))
+TERA_CONVERTER_BOT = _clean_username(_require("TERA_CONVERTER_BOT"))
+DISK_CONVERTER_BOT = _clean_username(_require("DISK_CONVERTER_BOT"))
+TERA_DESTINATION   = _clean_username(_require("TERA_DESTINATION"))
+DISK_DESTINATION   = _clean_username(_require("DISK_DESTINATION"))
 
-TERA_CONVERTER_BOT  = _clean_username(_require("TERA_CONVERTER_BOT"))
-DISK_CONVERTER_BOT  = _clean_username(_require("DISK_CONVERTER_BOT"))
-TERA_DESTINATION    = _clean_username(_require("TERA_DESTINATION"))
-DISK_DESTINATION    = _clean_username(_require("DISK_DESTINATION"))
+# Seed values from env (used only if DB has no data yet)
+_TERA_SEED = _parse_ids(os.environ.get("TERA_SOURCE_CHANNELS", ""))
+_DISK_SEED = _parse_ids(os.environ.get("DISK_SOURCE_CHANNELS", ""))
 
-ALL_SOURCE_IDS      = set(TERA_SOURCE_IDS + DISK_SOURCE_IDS)
 
-log.info("Tera sources  : %s", TERA_SOURCE_IDS)
-log.info("Disk sources  : %s", DISK_SOURCE_IDS)
-log.info("Tera converter: @%s → dest @%s", TERA_CONVERTER_BOT, TERA_DESTINATION)
-log.info("Disk converter: @%s → dest @%s", DISK_CONVERTER_BOT, DISK_DESTINATION)
+# ─────────────────────────────────────────────
+# DYNAMIC CHANNEL STATE (mutated at runtime)
+# ─────────────────────────────────────────────
+TERA_SOURCE_IDS: list[int] = list(_TERA_SEED)
+DISK_SOURCE_IDS: list[int] = list(_DISK_SEED)
+
+
+def all_source_ids() -> set[int]:
+    return set(TERA_SOURCE_IDS + DISK_SOURCE_IDS)
 
 
 # ─────────────────────────────────────────────
 # SUPABASE HELPERS
 # ─────────────────────────────────────────────
+_SB_BASE = SUPABASE_URL
+if _SB_BASE.endswith("/rest/v1"):
+    _SB_BASE = _SB_BASE[: -len("/rest/v1")]
+
+_SB_TABLE    = f"{_SB_BASE}/rest/v1/bot_config"
+_TERA_CH_KEY = "tera_source_channels"
+_DISK_CH_KEY = "disk_source_channels"
+
 _SB_HEADERS = {
     "apikey": SUPABASE_KEY,
     "Authorization": f"Bearer {SUPABASE_KEY}",
     "Content-Type": "application/json",
-    "Prefer": "return=minimal",
 }
-# Strip any trailing /rest/v1 from SUPABASE_URL to avoid duplication
-_SB_BASE = SUPABASE_URL.rstrip("/")
-if _SB_BASE.endswith("/rest/v1"):
-    _SB_BASE = _SB_BASE[: -len("/rest/v1")]
-_SB_TABLE = f"{_SB_BASE}/rest/v1/bot_config"
-_SESSION_KEY = "telegram_string_session"
 
 
-async def sb_get_session() -> Optional[str]:
-    """Fetch the stored Telegram String Session from Supabase."""
-    async with httpx.AsyncClient() as client:
-        r = await client.get(
+async def _sb_get(key: str) -> Optional[str]:
+    async with httpx.AsyncClient() as c:
+        r = await c.get(
             _SB_TABLE,
             headers=_SB_HEADERS,
-            params={"key_name": f"eq.{_SESSION_KEY}", "select": "key_value"},
+            params={"key_name": f"eq.{key}", "select": "key_value"},
         )
     if r.status_code == 200:
         rows = r.json()
@@ -116,90 +128,181 @@ async def sb_get_session() -> Optional[str]:
     return None
 
 
-async def sb_upsert_session(session_string: str) -> bool:
-    """Upsert the Telegram String Session into Supabase."""
-    payload = {"key_name": _SESSION_KEY, "key_value": session_string}
+async def _sb_upsert(key: str, value: str) -> bool:
     headers = {**_SB_HEADERS, "Prefer": "resolution=merge-duplicates,return=minimal"}
-    async with httpx.AsyncClient() as client:
-        r = await client.post(_SB_TABLE, headers=headers, json=payload)
-    if r.status_code in (200, 201, 204):
-        log.info("Session upserted to Supabase successfully.")
-        return True
-    log.error("Supabase upsert failed: %s %s", r.status_code, r.text)
-    return False
+    async with httpx.AsyncClient() as c:
+        r = await c.post(_SB_TABLE, headers=headers, json={"key_name": key, "key_value": value})
+    return r.status_code in (200, 201, 204)
+
+
+async def sb_load_channels() -> None:
+    """Load channel lists from Supabase on startup. Falls back to env seed."""
+    global TERA_SOURCE_IDS, DISK_SOURCE_IDS
+
+    tera_raw = await _sb_get(_TERA_CH_KEY)
+    if tera_raw:
+        try:
+            TERA_SOURCE_IDS = json.loads(tera_raw)
+            log.info("Tera channels loaded from DB: %s", TERA_SOURCE_IDS)
+        except Exception:
+            log.warning("Tera DB parse failed — using env seed.")
+    elif _TERA_SEED:
+        await _sb_upsert(_TERA_CH_KEY, json.dumps(_TERA_SEED))
+        TERA_SOURCE_IDS = list(_TERA_SEED)
+        log.info("Tera seed saved to DB: %s", TERA_SOURCE_IDS)
+
+    disk_raw = await _sb_get(_DISK_CH_KEY)
+    if disk_raw:
+        try:
+            DISK_SOURCE_IDS = json.loads(disk_raw)
+            log.info("Disk channels loaded from DB: %s", DISK_SOURCE_IDS)
+        except Exception:
+            log.warning("Disk DB parse failed — using env seed.")
+    elif _DISK_SEED:
+        await _sb_upsert(_DISK_CH_KEY, json.dumps(_DISK_SEED))
+        DISK_SOURCE_IDS = list(_DISK_SEED)
+        log.info("Disk seed saved to DB: %s", DISK_SOURCE_IDS)
+
+
+async def sb_save_tera() -> bool:
+    return await _sb_upsert(_TERA_CH_KEY, json.dumps(TERA_SOURCE_IDS))
+
+
+async def sb_save_disk() -> bool:
+    return await _sb_upsert(_DISK_CH_KEY, json.dumps(DISK_SOURCE_IDS))
 
 
 # ─────────────────────────────────────────────
-# GLOBAL STATE
+# GLOBAL CLIENTS
 # ─────────────────────────────────────────────
-
-# The admin bot client (always running)
 bot_client: TelegramClient = TelegramClient("bot_session", API_ID, API_HASH)
-
-# The userbot client (started only when session exists)
 userbot: Optional[TelegramClient] = None
 userbot_active: bool = False
 
-# Login state machine per admin user
-# States: "await_phone" | "await_otp" | "await_2fa"
-login_state: dict[int, dict] = {}
 
-# Temporary userbot during login (not yet authenticated)
-login_userbot: Optional[TelegramClient] = None
+# ─────────────────────────────────────────────
+# BOT MENU
+# ─────────────────────────────────────────────
+BOT_COMMANDS = [
+    BotCommand(command="start",       description="Bot status aur available commands"),
+    BotCommand(command="status",      description="Userbot connected hai ya nahi"),
+    BotCommand(command="tera_add",    description="Tera source channel add karo"),
+    BotCommand(command="tera_remove", description="Tera source channel remove karo"),
+    BotCommand(command="tera_list",   description="Tera source channels ki list"),
+    BotCommand(command="disk_add",    description="Disk source channel add karo"),
+    BotCommand(command="disk_remove", description="Disk source channel remove karo"),
+    BotCommand(command="disk_list",   description="Disk source channels ki list"),
+    BotCommand(command="report",      description="Sab channels ka live tracking status"),
+]
+
+
+async def set_bot_menu() -> None:
+    try:
+        await bot_client(SetBotCommandsRequest(
+            scope=BotCommandScopeDefault(),
+            lang_code="",
+            commands=BOT_COMMANDS,
+        ))
+        log.info("Bot menu set.")
+    except Exception as exc:
+        log.warning("Bot menu set failed: %s", exc)
 
 
 # ─────────────────────────────────────────────
-# USERBOT: ATTACH HANDLERS + START
+# USERBOT: RELOAD HANDLERS
 # ─────────────────────────────────────────────
+async def reload_userbot_handlers(notify_admin_id: Optional[int] = None) -> None:
+    """Remove all userbot handlers and re-attach with current channel lists."""
+    if not userbot or not userbot_active:
+        log.warning("reload called but userbot not active.")
+        return
 
-def attach_userbot_handlers(ub: TelegramClient) -> None:
-    """
-    Register all Telethon event handlers on the userbot.
-    Called once after the userbot is authenticated (either from saved session or fresh login).
-    """
+    userbot.remove_event_handler(None)
+    attach_userbot_handlers(userbot)
+    log.info("Userbot handlers reloaded. Tera=%s Disk=%s", TERA_SOURCE_IDS, DISK_SOURCE_IDS)
 
-    # ── Handler 1: Monitor source channels/groups for new posts ──────────────
-    @ub.on(events.NewMessage(chats=list(ALL_SOURCE_IDS)))
-    async def on_source_message(event):
-        msg = event.message
-        chat_id = event.chat_id
-
-        # Phase 2.1 — Media enforcement: must have photo or video
-        has_photo = bool(msg.photo)
-        has_video = (
-            msg.document is not None
-            and msg.document.mime_type is not None
-            and (
-                msg.document.mime_type.startswith("video/")
-                or msg.document.mime_type.startswith("image/")
+    if notify_admin_id:
+        try:
+            await bot_client.send_message(
+                notify_admin_id,
+                "🚀 **Tracking Start Successfully with updated channels!**\n\n"
+                f"📡 Tera: {TERA_SOURCE_IDS or 'None'}\n"
+                f"💾 Disk: {DISK_SOURCE_IDS or 'None'}",
             )
-        )
-        if not has_photo and not has_video:
-            return  # Drop text-only messages
+        except Exception as exc:
+            log.warning("Admin notify failed: %s", exc)
 
-        caption = (msg.message or "").lower()
 
-        # Phase 2.2 — Keyword-source alignment
-        if chat_id in TERA_SOURCE_IDS and "tera" in caption:
-            log.info("Tera match from %s — forwarding to @%s", chat_id, TERA_CONVERTER_BOT)
-            await safe_send(ub, TERA_CONVERTER_BOT, file=msg.media, message=msg.message or "")
+async def _save_and_reload(pipeline: str, admin_id: int) -> None:
+    ok = await sb_save_tera() if pipeline == "tera" else await sb_save_disk()
+    if not ok:
+        await bot_client.send_message(admin_id, "⚠️ DB save failed. Changes lost on restart.")
+    await reload_userbot_handlers(notify_admin_id=admin_id)
 
-        elif chat_id in DISK_SOURCE_IDS and "disk" in caption:
-            log.info("Disk match from %s — forwarding to @%s", chat_id, DISK_CONVERTER_BOT)
-            await safe_send(ub, DISK_CONVERTER_BOT, file=msg.media, message=msg.message or "")
 
-    # ── Handler 2: Intercept converter bot replies & relay to destination ─────
+# ─────────────────────────────────────────────
+# USERBOT: CHANNEL ACCESS CHECK
+# ─────────────────────────────────────────────
+async def check_channel_access(ub: TelegramClient, channel_id: int) -> tuple[bool, str]:
+    try:
+        entity = await ub.get_entity(channel_id)
+        name = getattr(entity, "title", None) or getattr(entity, "username", None) or str(channel_id)
+        return True, name
+    except errors.ChannelPrivateError:
+        return False, "Private/Banned"
+    except Exception as exc:
+        return False, f"Error: {exc}"
+
+
+# ─────────────────────────────────────────────
+# USERBOT: ATTACH HANDLERS
+# ─────────────────────────────────────────────
+def attach_userbot_handlers(ub: TelegramClient) -> None:
+    tera_ids = list(TERA_SOURCE_IDS)
+    disk_ids = list(DISK_SOURCE_IDS)
+    watch_ids = list(set(tera_ids + disk_ids))
+
+    # ── Source channel monitor ────────────────────────────────────────────────
+    if watch_ids:
+        @ub.on(events.NewMessage(chats=watch_ids))
+        async def on_source_message(event):
+            msg     = event.message
+            chat_id = event.chat_id
+
+            has_media = bool(msg.photo) or (
+                msg.document is not None
+                and msg.document.mime_type is not None
+                and (
+                    msg.document.mime_type.startswith("video/")
+                    or msg.document.mime_type.startswith("image/")
+                )
+            )
+            if not has_media:
+                return
+
+            caption = (msg.message or "").lower()
+
+            if chat_id in tera_ids and "tera" in caption:
+                log.info("Tera match from %s → @%s", chat_id, TERA_CONVERTER_BOT)
+                await safe_send(ub, TERA_CONVERTER_BOT, file=msg.media, message=msg.message or "")
+
+            elif chat_id in disk_ids and "disk" in caption:
+                log.info("Disk match from %s → @%s", chat_id, DISK_CONVERTER_BOT)
+                await safe_send(ub, DISK_CONVERTER_BOT, file=msg.media, message=msg.message or "")
+
+    else:
+        log.warning("No source channels — source handler skipped.")
+
+    # ── Converter reply handler ───────────────────────────────────────────────
     @ub.on(events.NewMessage(from_users=[TERA_CONVERTER_BOT, DISK_CONVERTER_BOT]))
     async def on_converter_reply(event):
-        msg = event.message
+        msg    = event.message
         sender = event.sender
 
-        # Resolve sender username safely
         sender_username = ""
         if sender and getattr(sender, "username", None):
             sender_username = _clean_username(sender.username)
 
-        # ── Step 1: Sender se dest/keyword decide karo ──────────────────────────
         if sender_username == TERA_CONVERTER_BOT:
             dest, label, keyword = TERA_DESTINATION, "Tera", "tera"
         elif sender_username == DISK_CONVERTER_BOT:
@@ -207,9 +310,7 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
         else:
             return
 
-        # ── Step 2: Media check ───────────────────────────────────────────────
-        has_photo = bool(msg.photo)
-        has_video = (
+        has_media = bool(msg.photo) or (
             msg.document is not None
             and msg.document.mime_type is not None
             and (
@@ -217,12 +318,10 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
                 or msg.document.mime_type.startswith("image/")
             )
         )
-        if not has_photo and not has_video:
-            log.info("%s converter reply skipped — no media.", label)
+        if not has_media:
+            log.info("%s converter reply — no media, skipped.", label)
             return
 
-        # ── Step 3: Keyword must be inside a URL ─────────────────────────────
-        import re as _re
         raw_text = (msg.message or "").lower()
         all_urls = []
 
@@ -243,99 +342,104 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
                     if btn_url:
                         all_urls.append(btn_url.lower())
 
-        # Regex fallback — plain text URLs (bold Unicode text me entities nahi banti)
-        all_urls.extend(_re.findall(r"https?://\S+", raw_text))
+        # Regex fallback for bold-Unicode formatted text
+        all_urls.extend(re.findall(r"https?://\S+", raw_text))
         all_urls = list(set(all_urls))
 
         if not any(keyword in url for url in all_urls):
-            log.info(
-                "%s reply skipped — keyword '%s' not in any URL. URLs: %s",
-                label, keyword, all_urls,
-            )
+            log.info("%s reply — keyword '%s' not in URLs: %s", label, keyword, all_urls)
             return
 
-        log.info("%s keyword '%s' found — sending to @%s", label, keyword, dest)
+        log.info("%s → sending to @%s", label, dest)
+        await safe_send(ub, dest, file=msg.media, message=msg.message or "")
 
-        # ── Step 4: Forward converter reply AS-IS (media + caption from converter)
-        await safe_send(
-            ub,
-            dest,
-            file=msg.media,
-            message=msg.message or "",
-        )
+    # ── Real-time channel deletion/ban alert ──────────────────────────────────
+    @ub.on(events.ChatAction())
+    async def on_chat_action(event):
+        try:
+            chat_id = event.chat_id
+            if chat_id not in all_source_ids():
+                return
+
+            action     = event.action_message
+            if action is None:
+                return
+
+            action_type = type(action).__name__.lower()
+            signals     = ["channeldelete", "chatdelete", "userban", "kickedout"]
+            if not any(s in action_type for s in signals):
+                return
+
+            category = "Tera" if chat_id in TERA_SOURCE_IDS else "Disk"
+            alert = (
+                f"⚠️ **Alert: Tracking Stopped! Source Channel deleted or inaccessible.**\n"
+                f"🔹 Category: {category}\n"
+                f"🔹 Channel ID: `{chat_id}`"
+            )
+            for admin_id in ADMIN_IDS:
+                try:
+                    await bot_client.send_message(admin_id, alert)
+                except Exception:
+                    pass
+        except Exception as exc:
+            log.warning("on_chat_action error: %s", exc)
 
 
-async def start_userbot(session_string: str) -> bool:
-    """
-    Initialize and connect the Userbot using a saved StringSession.
-    Returns True on success.
-    """
+# ─────────────────────────────────────────────
+# START USERBOT
+# ─────────────────────────────────────────────
+async def start_userbot() -> bool:
     global userbot, userbot_active
 
-    log.info("Starting Userbot with saved StringSession...")
-    ub = TelegramClient(StringSession(session_string), API_ID, API_HASH)
+    log.info("Starting userbot...")
+    ub = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
     try:
         await ub.start()
         if not await ub.is_user_authorized():
-            log.error("Userbot session is invalid/expired.")
+            log.error("STRING_SESSION is invalid or expired.")
             return False
 
         me = await ub.get_me()
         log.info("Userbot connected as: %s (id=%s)", me.username or me.first_name, me.id)
 
         attach_userbot_handlers(ub)
-        userbot = ub
+        userbot        = ub
         userbot_active = True
         return True
 
     except Exception as exc:
-        log.exception("Failed to start userbot: %s", exc)
+        log.exception("Userbot start failed: %s", exc)
         return False
 
 
 # ─────────────────────────────────────────────
-# SAFE SEND HELPER (FloodWait aware)
+# SAFE SEND
 # ─────────────────────────────────────────────
-
-async def safe_send(
-    client: TelegramClient,
-    target: str,
-    message: str = "",
-    file=None,
-):
-    """
-    Send a message (with optional media) to `target`.
-    Handles FloodWaitError gracefully.
-    Returns the sent Message object, or None on failure.
-    """
+async def safe_send(client: TelegramClient, target: str, message: str = "", file=None):
     for attempt in range(3):
         try:
             if file:
                 return await client.send_message(target, message, file=file)
-            else:
-                if message.strip():
-                    return await client.send_message(target, message)
+            if message.strip():
+                return await client.send_message(target, message)
             return None
         except errors.FloodWaitError as e:
-            log.warning("FloodWait: sleeping %ds (attempt %d/3)", e.seconds, attempt + 1)
+            log.warning("FloodWait %ds (attempt %d/3)", e.seconds, attempt + 1)
             await asyncio.sleep(e.seconds + 2)
         except errors.UserIsBlockedError:
-            log.error("Bot is blocked by %s — skipping.", target)
+            log.error("Blocked by %s — skipping.", target)
             return None
         except Exception as exc:
-            log.exception("safe_send failed for %s: %s", target, exc)
+            log.exception("safe_send → %s: %s", target, exc)
             return None
     return None
 
 
 # ─────────────────────────────────────────────
-# ADMIN BOT HANDLERS
+# ADMIN DECORATOR
 # ─────────────────────────────────────────────
-
 def admin_only(handler):
-    """Decorator: silently ignore messages from non-admins."""
-    import functools
     @functools.wraps(handler)
     async def wrapper(event):
         if event.sender_id not in ADMIN_IDS:
@@ -344,225 +448,171 @@ def admin_only(handler):
     return wrapper
 
 
+# ─────────────────────────────────────────────
+# ADMIN BOT HANDLERS
+# ─────────────────────────────────────────────
 def register_bot_handlers() -> None:
-    """Attach all command/message handlers to the admin bot."""
 
-    # ── /start ────────────────────────────────────────────────────────────────
+    # /start
     @bot_client.on(events.NewMessage(pattern=r"^/start$"))
     @admin_only
     async def cmd_start(event):
         status = "🟢 Connected" if userbot_active else "🔴 Offline"
         await event.respond(
             f"**XVIP Hybrid Bot**\n\n"
-            f"Userbot Status: {status}\n\n"
-            f"Commands:\n"
-            f"`/status` — check userbot status\n"
-            f"`/login`  — authenticate userbot (if offline)\n"
+            f"Userbot: {status}\n\n"
+            f"**Channel Management:**\n"
+            f"`/tera_add <id>` — Tera source add\n"
+            f"`/tera_remove <id>` — Tera source remove\n"
+            f"`/tera_list` — Tera sources list\n"
+            f"`/disk_add <id>` — Disk source add\n"
+            f"`/disk_remove <id>` — Disk source remove\n"
+            f"`/disk_list` — Disk sources list\n\n"
+            f"**Reports:**\n"
+            f"`/status` — Userbot info\n"
+            f"`/report` — Live tracking status\n"
         )
 
-    # ── /status ───────────────────────────────────────────────────────────────
+    # /status
     @bot_client.on(events.NewMessage(pattern=r"^/status$"))
     @admin_only
     async def cmd_status(event):
         if userbot_active and userbot:
             try:
-                me = await userbot.get_me()
+                me   = await userbot.get_me()
                 name = me.username or me.first_name or str(me.id)
-                await event.respond(f"🟢 **Userbot Connected**\nLogged in as: @{name}")
+                await event.respond(
+                    f"🟢 **Userbot Connected**\n"
+                    f"Account: @{name}\n"
+                    f"📡 Tera channels: {len(TERA_SOURCE_IDS)}\n"
+                    f"💾 Disk channels: {len(DISK_SOURCE_IDS)}"
+                )
             except Exception:
-                await event.respond("🟡 Userbot started but couldn't fetch profile.")
+                await event.respond("🟡 Userbot started but profile fetch failed.")
         else:
-            await event.respond("🔴 **Userbot Offline**\nType `/login` to authenticate.")
+            await event.respond(
+                "🔴 **Userbot Offline**\n"
+                "Check `STRING_SESSION` env var aur redeploy karo."
+            )
 
-    # ── /login — Step 1: ask for phone ───────────────────────────────────────
-    @bot_client.on(events.NewMessage(pattern=r"^/login$"))
+    # /tera_add
+    @bot_client.on(events.NewMessage(pattern=r"^/tera_add\s+(-?\d+)$"))
     @admin_only
-    async def cmd_login(event):
-        if userbot_active:
-            await event.respond("✅ Userbot is already connected. Use `/status` to verify.")
+    async def cmd_tera_add(event):
+        ch_id = int(event.pattern_match.group(1))
+        if ch_id in TERA_SOURCE_IDS:
+            await event.respond(f"⚠️ `{ch_id}` already in Tera list.")
+            return
+        TERA_SOURCE_IDS.append(ch_id)
+        await event.respond(f"✅ Added `{ch_id}` to Tera.\nSaving & reloading...")
+        await _save_and_reload("tera", event.sender_id)
+
+    # /tera_remove
+    @bot_client.on(events.NewMessage(pattern=r"^/tera_remove\s+(-?\d+)$"))
+    @admin_only
+    async def cmd_tera_remove(event):
+        ch_id = int(event.pattern_match.group(1))
+        if ch_id not in TERA_SOURCE_IDS:
+            await event.respond(f"⚠️ `{ch_id}` not found in Tera list.")
+            return
+        TERA_SOURCE_IDS.remove(ch_id)
+        await event.respond(f"🗑 Removed `{ch_id}` from Tera.\nSaving & reloading...")
+        await _save_and_reload("tera", event.sender_id)
+
+    # /tera_list
+    @bot_client.on(events.NewMessage(pattern=r"^/tera_list$"))
+    @admin_only
+    async def cmd_tera_list(event):
+        if not TERA_SOURCE_IDS:
+            await event.respond("📭 Tera list is empty.")
+            return
+        lines = "\n".join(f"• `{ch}`" for ch in TERA_SOURCE_IDS)
+        await event.respond(f"📡 **Tera Source Channels ({len(TERA_SOURCE_IDS)}):**\n{lines}")
+
+    # /disk_add
+    @bot_client.on(events.NewMessage(pattern=r"^/disk_add\s+(-?\d+)$"))
+    @admin_only
+    async def cmd_disk_add(event):
+        ch_id = int(event.pattern_match.group(1))
+        if ch_id in DISK_SOURCE_IDS:
+            await event.respond(f"⚠️ `{ch_id}` already in Disk list.")
+            return
+        DISK_SOURCE_IDS.append(ch_id)
+        await event.respond(f"✅ Added `{ch_id}` to Disk.\nSaving & reloading...")
+        await _save_and_reload("disk", event.sender_id)
+
+    # /disk_remove
+    @bot_client.on(events.NewMessage(pattern=r"^/disk_remove\s+(-?\d+)$"))
+    @admin_only
+    async def cmd_disk_remove(event):
+        ch_id = int(event.pattern_match.group(1))
+        if ch_id not in DISK_SOURCE_IDS:
+            await event.respond(f"⚠️ `{ch_id}` not found in Disk list.")
+            return
+        DISK_SOURCE_IDS.remove(ch_id)
+        await event.respond(f"🗑 Removed `{ch_id}` from Disk.\nSaving & reloading...")
+        await _save_and_reload("disk", event.sender_id)
+
+    # /disk_list
+    @bot_client.on(events.NewMessage(pattern=r"^/disk_list$"))
+    @admin_only
+    async def cmd_disk_list(event):
+        if not DISK_SOURCE_IDS:
+            await event.respond("📭 Disk list is empty.")
+            return
+        lines = "\n".join(f"• `{ch}`" for ch in DISK_SOURCE_IDS)
+        await event.respond(f"💾 **Disk Source Channels ({len(DISK_SOURCE_IDS)}):**\n{lines}")
+
+    # /report
+    @bot_client.on(events.NewMessage(pattern=r"^/report$"))
+    @admin_only
+    async def cmd_report(event):
+        if not userbot_active or not userbot:
+            await event.respond("🔴 Userbot offline — channel check possible nahi.\nCheck `STRING_SESSION` env var.")
             return
 
-        login_state[event.sender_id] = {"step": "await_phone"}
+        await event.respond("🔍 Checking all source channels... please wait.")
+
+        async def check_list(ids: list[int]) -> list[str]:
+            lines = []
+            for ch_id in ids:
+                ok, name = await check_channel_access(userbot, ch_id)
+                lines.append(f"{'✅' if ok else '❌'} `{ch_id}` — {name}")
+            return lines
+
+        tera_lines = await check_list(TERA_SOURCE_IDS)
+        disk_lines = await check_list(DISK_SOURCE_IDS)
+
         await event.respond(
-            "📱 **Login Step 1/3**\n\nSend your Telegram phone number in international format:\n`+91XXXXXXXXXX`"
+            f"📊 **Live Tracking Report**\n\n"
+            f"📡 **Tera ({len(TERA_SOURCE_IDS)}):**\n"
+            f"{chr(10).join(tera_lines) or '_None configured_'}\n\n"
+            f"💾 **Disk ({len(DISK_SOURCE_IDS)}):**\n"
+            f"{chr(10).join(disk_lines) or '_None configured_'}\n\n"
+            f"✅ = accessible  ❌ = deleted/banned"
         )
-
-    # ── Generic message handler — drives the login state machine ─────────────
-    @bot_client.on(events.NewMessage)
-    async def on_message(event):
-        # Admin check inline (decorator causes Telethon registration issues)
-        if event.sender_id not in ADMIN_IDS:
-            return
-        # Ignore commands — handled above
-        if event.message.message.startswith("/"):
-            return
-
-        uid = event.sender_id
-        state = login_state.get(uid)
-        if not state:
-            return  # Not in a login flow
-
-        step = state.get("step")
-
-        # ── STEP A: Receive phone number ──────────────────────────────────
-        if step == "await_phone":
-            phone = event.message.message.strip()
-            if not phone.startswith("+"):
-                await event.respond("❌ Invalid format. Use `+CountryCodeNumber` (e.g. `+919876543210`)")
-                return
-
-            state["phone"] = phone
-
-            # Create a fresh temp client for the login flow
-            global login_userbot
-            login_userbot = TelegramClient(StringSession(), API_ID, API_HASH)
-            await login_userbot.connect()
-
-            try:
-                result = await login_userbot.send_code_request(phone)
-                state["phone_code_hash"] = result.phone_code_hash
-                state["step"] = "await_otp"
-                state["otp_requested_at"] = asyncio.get_event_loop().time()
-
-                await event.respond(
-                    "📟 **Login Step 2/3**\n\n"
-                    "OTP aapke Telegram par bheja gaya hai.\n\n"
-                    "⚠️ **OTP sirf ~60 seconds valid hai — turant bhejo!**\n\n"
-                    "Code bhejo (spaces hata ke): e.g. `12345`\n"
-                    "Ya space ke saath bhi chalega: `1 2 3 4 5`"
-                )
-            except errors.PhoneNumberInvalidError:
-                await event.respond("❌ Phone number is invalid. Restart with `/login`.")
-                login_state.pop(uid, None)
-            except Exception as exc:
-                await event.respond(f"❌ Error: `{exc}`\nRestart with `/login`.")
-                login_state.pop(uid, None)
-
-        # ── STEP B: Receive OTP ───────────────────────────────────────────
-        elif step == "await_otp":
-            # Strip spaces so "1 2 3 4 5" → "12345"
-            otp = event.message.message.strip().replace(" ", "")
-            phone = state["phone"]
-            code_hash = state["phone_code_hash"]
-
-            log.info("OTP attempt: phone=%s otp_len=%d otp_val=%s hash=%s", phone, len(otp), otp, code_hash[:8])
-
-            try:
-                await login_userbot.sign_in(phone, otp, phone_code_hash=code_hash)
-                log.info("sign_in succeeded for %s", phone)
-                # OTP success — no 2FA needed
-                await _finalize_login(event, uid)
-
-            except errors.SessionPasswordNeededError:
-                log.info("2FA required for %s", phone)
-                state["step"] = "await_2fa"
-                await event.respond(
-                    "🔐 **Login Step 3/3 — 2FA Required**\n\nEnter your Two-Factor Authentication cloud password:"
-                )
-            except errors.PhoneCodeInvalidError as exc:
-                log.warning("PhoneCodeInvalid: %s", exc)
-                await event.respond("❌ Wrong OTP. Send the correct 5-digit code:")
-            except errors.PhoneCodeExpiredError as exc:
-                log.warning("PhoneCodeExpired: %s", exc)
-                try:
-                    result = await login_userbot.send_code_request(phone)
-                    state["phone_code_hash"] = result.phone_code_hash
-                    await event.respond(
-                        "⏰ **OTP expire hua — naya OTP bheja gaya!**\n\n"
-                        "Apne Telegram par naya code dekho aur **turant** bhejo!"
-                    )
-                except Exception as exc2:
-                    await event.respond(f"❌ OTP expired aur re-request bhi fail: `{exc2}`\nRestart with `/login`.")
-                    login_state.pop(uid, None)
-            except Exception as exc:
-                log.exception("sign_in unexpected error: %s", exc)
-                await event.respond(f"❌ sign_in error: `{exc}`\nRestart with `/login`.")
-                login_state.pop(uid, None)
-
-        # ── STEP C: Receive 2FA password ──────────────────────────────────
-        elif step == "await_2fa":
-            password = event.message.message.strip()
-            try:
-                await login_userbot.sign_in(password=password)
-                await _finalize_login(event, uid)
-
-            except errors.PasswordHashInvalidError:
-                await event.respond("❌ Wrong 2FA password. Try again:")
-            except Exception as exc:
-                await event.respond(f"❌ 2FA error: `{exc}`\nRestart with `/login`.")
-                login_state.pop(uid, None)
-
-
-async def _finalize_login(event, uid: int) -> None:
-    """
-    Called after successful Telethon authentication (OTP or 2FA).
-    Saves session to Supabase and activates the userbot live.
-    """
-    global userbot, userbot_active, login_userbot
-
-    try:
-        session_string = login_userbot.session.save()
-
-        # Persist to Supabase
-        ok = await sb_upsert_session(session_string)
-        if not ok:
-            await event.respond("⚠️ Authenticated but failed to save session to Supabase. Try `/login` again.")
-            login_state.pop(uid, None)
-            return
-
-        # Attach handlers and go live — no reboot needed
-        me = await login_userbot.get_me()
-        name = me.username or me.first_name or str(me.id)
-
-        attach_userbot_handlers(login_userbot)
-        userbot = login_userbot
-        userbot_active = True
-        login_userbot = None  # Hand off ownership
-        login_state.pop(uid, None)
-
-        log.info("Userbot activated live for: %s", name)
-        await event.respond(
-            f"✅ **Userbot Activated!**\n\nLogged in as: @{name}\n\n"
-            f"Now monitoring {len(ALL_SOURCE_IDS)} source channel(s)/group(s).\n"
-            f"No reboot required. 🚀"
-        )
-
-    except Exception as exc:
-        log.exception("_finalize_login failed: %s", exc)
-        await event.respond(f"❌ Post-login error: `{exc}`")
-        login_state.pop(uid, None)
 
 
 # ─────────────────────────────────────────────
-# MAIN ENTRYPOINT
+# MAIN
 # ─────────────────────────────────────────────
-
 async def main():
-    log.info("Booting XVIP Hybrid Bot...")
+    log.info("Booting XVIP...")
 
-    # ── Step 1: Start the admin bot client ──────────────────────────────────
     await bot_client.start(bot_token=BOT_TOKEN)
     log.info("Admin bot started.")
 
-    # ── Step 2: Register admin bot handlers ─────────────────────────────────
+    await set_bot_menu()
+    await sb_load_channels()
+
     register_bot_handlers()
 
-    # ── Step 3: Check Supabase for an existing session ───────────────────────
-    saved_session = os.environ.get("STRING_SESSION", "").strip() or await sb_get_session()
-
-    if saved_session:
-        log.info("Found saved session in Supabase — starting userbot...")
-        success = await start_userbot(saved_session)
-        if not success:
-            log.warning("Saved session is invalid. Admin must run /login to re-authenticate.")
-    else:
-        log.warning("No session found in Supabase. Admin must send /login to the bot.")
-
-    # ── Step 4: Run both clients concurrently ────────────────────────────────
-    log.info("Running. Press Ctrl+C to stop.")
-
-    # Use run_until_disconnected on the bot (primary).
-    # Userbot runs in background — its handlers fire independently.
+    success = await start_userbot()
+    if not success:
+        log.error("Userbot failed to start. Check STRING_SESSION env var.")
+        # Bot stays alive so admin can see /status
+    
+    log.info("Running.")
     await bot_client.run_until_disconnected()
 
 

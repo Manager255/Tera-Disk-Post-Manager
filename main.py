@@ -190,6 +190,13 @@ bot_client: TelegramClient = TelegramClient("bot_session", API_ID, API_HASH)
 userbot: Optional[TelegramClient] = None
 userbot_active: bool = False
 
+# Track registered userbot handlers for clean removal on reload
+_userbot_handlers: list = []
+
+# Dedup: converter reply message IDs already processed
+_seen_converter_msgs: set[int] = set()
+_SEEN_MAX = 500
+
 
 # ─────────────────────────────────────────────
 # BOT MENU
@@ -223,12 +230,18 @@ async def set_bot_menu() -> None:
 # USERBOT: RELOAD HANDLERS
 # ─────────────────────────────────────────────
 async def reload_userbot_handlers(notify_admin_id: Optional[int] = None) -> None:
-    """Remove all userbot handlers and re-attach with current channel lists."""
+    """Remove tracked userbot handlers and re-attach with current channel lists."""
+    global _userbot_handlers, _seen_converter_msgs
     if not userbot or not userbot_active:
         log.warning("reload called but userbot not active.")
         return
 
-    userbot.remove_event_handler(None)
+    # Remove only our registered handlers (not all handlers)
+    for callback, event in _userbot_handlers:
+        userbot.remove_event_handler(callback, event)
+    _userbot_handlers.clear()
+    _seen_converter_msgs.clear()  # reset dedup on reload
+
     attach_userbot_handlers(userbot)
     log.info("Userbot handlers reloaded. Tera=%s Disk=%s", TERA_SOURCE_IDS, DISK_SOURCE_IDS)
 
@@ -269,13 +282,15 @@ async def check_channel_access(ub: TelegramClient, channel_id: int) -> tuple[boo
 # USERBOT: ATTACH HANDLERS
 # ─────────────────────────────────────────────
 def attach_userbot_handlers(ub: TelegramClient) -> None:
+    global _userbot_handlers
     tera_ids = list(TERA_SOURCE_IDS)
     disk_ids = list(DISK_SOURCE_IDS)
     watch_ids = list(set(tera_ids + disk_ids))
 
     # ── Source channel monitor ────────────────────────────────────────────────
     if watch_ids:
-        @ub.on(events.NewMessage(chats=watch_ids))
+        src_event = events.NewMessage(chats=watch_ids)
+
         async def on_source_message(event):
             msg     = event.message
             chat_id = event.chat_id
@@ -301,15 +316,28 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
                 log.info("Disk match from %s → @%s", chat_id, DISK_CONVERTER_BOT)
                 await safe_send(ub, DISK_CONVERTER_BOT, file=msg.media, message=msg.message or "")
 
+        ub.add_event_handler(on_source_message, src_event)
+        _userbot_handlers.append((on_source_message, src_event))
     else:
         log.warning("No source channels — source handler skipped.")
 
     # ── Converter reply handler ───────────────────────────────────────────────
-    @ub.on(events.NewMessage(from_users=[TERA_CONVERTER_BOT, DISK_CONVERTER_BOT]))
-    async def on_converter_reply(event):
-        msg    = event.message
-        sender = event.sender
+    conv_event = events.NewMessage(from_users=[TERA_CONVERTER_BOT, DISK_CONVERTER_BOT])
 
+    async def on_converter_reply(event):
+        global _seen_converter_msgs
+        msg    = event.message
+
+        # DEDUP: skip if already processed this message
+        if msg.id in _seen_converter_msgs:
+            log.info("Converter reply msg_id=%s already processed — skipping duplicate.", msg.id)
+            return
+        _seen_converter_msgs.add(msg.id)
+        if len(_seen_converter_msgs) > _SEEN_MAX:
+            # Keep only the latest 250
+            _seen_converter_msgs = set(list(_seen_converter_msgs)[-250:])
+
+        sender = event.sender
         sender_username = ""
         if sender and getattr(sender, "username", None):
             sender_username = _clean_username(sender.username)
@@ -364,8 +392,12 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
         log.info("%s → sending to @%s", label, dest)
         await safe_send(ub, dest, file=msg.media, message=msg.message or "")
 
+    ub.add_event_handler(on_converter_reply, conv_event)
+    _userbot_handlers.append((on_converter_reply, conv_event))
+
     # ── Real-time channel deletion/ban alert ──────────────────────────────────
-    @ub.on(events.ChatAction())
+    chat_event = events.ChatAction()
+
     async def on_chat_action(event):
         try:
             chat_id = event.chat_id
@@ -395,14 +427,19 @@ def attach_userbot_handlers(ub: TelegramClient) -> None:
         except Exception as exc:
             log.warning("on_chat_action error: %s", exc)
 
+    ub.add_event_handler(on_chat_action, chat_event)
+    _userbot_handlers.append((on_chat_action, chat_event))
+
 
 # ─────────────────────────────────────────────
 # START USERBOT
 # ─────────────────────────────────────────────
 async def start_userbot() -> bool:
-    global userbot, userbot_active
+    global userbot, userbot_active, _userbot_handlers, _seen_converter_msgs
 
     log.info("Starting userbot...")
+    _userbot_handlers.clear()
+    _seen_converter_msgs.clear()
     ub = TelegramClient(StringSession(STRING_SESSION), API_ID, API_HASH)
 
     try:
